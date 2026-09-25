@@ -19,7 +19,10 @@
 //      maxSamples 不大于上一跳；
 //   3. 每跳在评估时刻必须处于有效期内；
 //   4. 末端命令的 buoy 须获全部上游 aud 允许，samples 不超过任一 maxSamples；
-//   5. 任一失败即拒绝，并定位首个限制字段或签名失败跳。
+//   5. 任一失败即拒绝，并定位链中最先可判定的违规跳：
+//      严格按跳号递增核验，跳内顺序为 签名 → 签发关系 → 收紧 → 时效。
+//      因此前序已成立的限制放宽不会被后续对象的签名失败掩盖；
+//      反之当前跳之前均合法时，任一对象单独被篡改仍定位该对象的签名失败。
 
 import crypto from 'node:crypto';
 import {
@@ -263,16 +266,21 @@ function verifyChain(input) {
     hops.push({ model, payloadBytes, payloadDigest, sig: model.sig });
   }
 
+  // 逐跳、按链序一次核验：签名 → 签发关系 → 收紧 → 时效。
+  // 必须在同一个按跳递增的循环内完成——若先整链验签再做业务检查，
+  // 后续跳的签名失败会先于前序已成立的限制放宽被报告，掩盖首个业务违规。
   for (let i = 0; i < hops.length; i++) {
     const hop = hops[i];
+    const model = hop.model;
 
-    // 1) 逐跳验签（用本跳 iss 的公钥）
+    // 1) 验签（用本跳 iss 的公钥）：当前序号之前均合法时，
+    //    该对象被单独篡改即在此被定位
     let sigOk = false;
     try {
       sigOk = crypto.verify('sha256', hop.payloadBytes, {
-        key: importJwk(hop.model.iss),
+        key: importJwk(model.iss),
         dsaEncoding: 'ieee-p1363',
-      }, hop.model.sigRaw);
+      }, model.sigRaw);
     } catch {
       sigOk = false;
     }
@@ -280,10 +288,6 @@ function verifyChain(input) {
       return fail(new ChainError('BAD_SIGNATURE', i, '$["sig"]',
         `第 ${i} 跳签名验证失败（签名与规范载荷摘要不符，载荷 SHA-256=${hop.payloadDigest}）`));
     }
-  }
-
-  for (let i = 0; i < hops.length; i++) {
-    const model = hops[i].model;
 
     // 2) 链式签发关系
     if (i === 0) {
@@ -296,7 +300,7 @@ function verifyChain(input) {
         `第 ${i} 跳委托并非由前一主体签发（iss ≠ 第 ${i - 1} 跳 sub）`));
     }
 
-    // 3) 收紧检查（仅允许收紧，定位首个违规字段）
+    // 3) 收紧检查（仅允许收紧，定位跳内首个违规字段）
     if (i > 0) {
       const prev = hops[i - 1].model;
       if (model.nbf < prev.nbf) {
@@ -319,7 +323,7 @@ function verifyChain(input) {
       }
     }
 
-    // 4) 有效期（评估时刻须落在每跳时间窗内）
+    // 4) 有效期（评估时刻须落在该跳时间窗内）
     if (now < model.nbf) {
       return fail(new ChainError('TIME_NOT_YET_VALID', i, '$["nbf"]',
         `第 ${i} 跳尚未生效（now=${now} < nbf=${model.nbf}）`));

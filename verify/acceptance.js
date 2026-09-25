@@ -4,10 +4,13 @@
 // 一次性验收服务 verify：
 //   1. 复核合法链的逐跳证据（每跳签名、规范载荷摘要、收紧约束、准许结论）；
 //   2. 复核越权链的拒绝（浮标未获上游允许 / 采样量超限 / 约束放宽），定位跳与字段；
-//   3. 复核篡改签名 / 改写载荷的拒绝（BAD_SIGNATURE）；
-//   4. 复核结构性错误（重复键、键序不规范、不安全 / 越界整数、非有限数、链首非根公钥）；
-//   5. 运行相关代码测试（node --test tests/）与页面构建检查；
-//   6. 启动本机服务做健康地址 API/HTTP 冒烟；GATEWAY_URL 存在时再冒烟对端。
+//   3. 复核“首个可判定违规”定位：前序已签名放宽 + 后续签名被篡改时，
+//      必须稳定报告前序放宽的跳号/字段/说明，且对照场景仍定位被篡改对象；
+//   4. 复核篡改签名 / 改写载荷的拒绝（BAD_SIGNATURE）；
+//   5. 复核结构性错误（重复键、键序不规范、不安全 / 越界整数、非有限数、链首非根公钥）；
+//   6. 运行相关代码测试（node --test tests/）与页面构建检查；
+//   7. 启动本机服务做健康地址 API/HTTP 冒烟（含上述组合场景的真实 HTTP 核验）；
+//      GATEWAY_URL 存在时再冒烟对端。
 //
 // 执行完毕即退出：0 全部通过，1 存在验收失败，2 执行异常。
 
@@ -64,9 +67,46 @@ function resign(value, privateJwk) {
   return canonicalize({ ...payload, sig: sigB64 });
 }
 
+// 组合场景夹具：root -> A 仅允许 buoy-01；A -> B 的委托签名完全有效，
+// 但把允许浮标扩大到 buoy-02（widenAud）；末端由 B 签发命令后，
+// 再改写命令中一个已签名业务字段（samples）且不重新签名（tamperCommand）。
+function buildWidenedThenTamperedChain({ widenAud = true, tamperCommand = true } = {}) {
+  const root = generateKeyPair();
+  const a = generateKeyPair();
+  const b = generateKeyPair();
+  const d1 = issueDelegation({
+    iss: root.publicJwk, sub: a.publicJwk,
+    nbf: NOW - 3600, exp: NOW + 3600,
+    aud: ['buoy-01'], maxSamples: 100,
+  }, root.privateJwk);
+  const d2 = issueDelegation({
+    iss: a.publicJwk, sub: b.publicJwk,
+    nbf: NOW - 1800, exp: NOW + 1800,
+    aud: widenAud ? ['buoy-01', 'buoy-02'] : ['buoy-01'], maxSamples: 60,
+  }, a.privateJwk);
+  let cmd = issueCommand({
+    iss: b.publicJwk, sub: b.publicJwk,
+    nbf: NOW - 900, exp: NOW + 900,
+    aud: ['buoy-01'], maxSamples: 60,
+    buoy: 'buoy-01', samples: 40,
+  }, b.privateJwk);
+  if (tamperCommand) {
+    const v = parseCanonical(cmd, { requireOrderedKeys: false }).value;
+    v.samples = 41;
+    cmd = canonicalize(v);
+  }
+  return {
+    rootKeyText: rootKeyDocument(root.publicJwk),
+    objectTexts: [d1, d2, cmd],
+    now: NOW,
+    // 暴露密钥便于派生根公钥不符等衍生场景
+    _keys: { root, a, b },
+  };
+}
+
 // ---------- 1) 合法链逐跳证据 ----------
 function sectionValidChain() {
-  console.log('\n[1/6] 合法链逐跳证据复核');
+  console.log('\n[1/7] 合法链逐跳证据复核');
   const root = generateKeyPair();
   const a = generateKeyPair();
   const b = generateKeyPair();
@@ -119,7 +159,7 @@ function sectionValidChain() {
 
 // ---------- 2) 越权链 ----------
 function sectionOverPrivileged() {
-  console.log('\n[2/6] 越权链拒绝复核');
+  console.log('\n[2/7] 越权链拒绝复核');
 
   // 2a. 末端浮标未获上游允许（第 0 跳允许 buoy-01/02，末端命令仅允许 buoy-01，
   //     命令请求 buoy-02 → 首个限制跳为末端 hop=1）
@@ -189,9 +229,66 @@ function sectionOverPrivileged() {
   }, 'ISSUER_MISMATCH', 1, '$["iss"]');
 }
 
-// ---------- 3) 篡改签名 / 改写载荷 ----------
+// ---------- 3) 首个可判定违规定位（前序已签名放宽 + 后续签名篡改）----------
+function sectionFirstViolationOrdering() {
+  console.log('\n[3/7] 首个可判定违规定位复核（前序放宽 + 后续篡改）');
+
+  // 核心组合：hop1 由 A 合法签名但放宽浮标集合，hop2 命令已签名字段被改写
+  const c = buildWidenedThenTamperedChain({ widenAud: true, tamperCommand: true });
+  const r = verifyChain(c);
+  const good = !r.ok && r.error.code === 'NOT_TIGHTENED'
+    && r.error.hop === 1 && r.error.field === '$["aud"]'
+    && /buoy-02/.test(r.error.message);
+  check('前序已签名放宽浮标 + 后续命令签名被篡改：优先定位 hop=1 的 aud 放宽',
+    good, good ? '' : `实际=${JSON.stringify(r.ok ? r.evidence.verdict : r.error)}`);
+
+  // 稳定性：同一输入重复核验，首个违规的跳号/字段/说明必须完全一致
+  const again = verifyChain(c);
+  check('组合场景重复核验：跳号/字段/说明稳定不变',
+    !again.ok && JSON.stringify(again.error) === JSON.stringify(r.error),
+    `首次=${JSON.stringify(r.error)}；再次=${JSON.stringify(again.error)}`);
+
+  // 对照一：前序均合法、仅末端命令被篡改 → 定位末端 hop=2 的签名失败
+  const onlyCmd = buildWidenedThenTamperedChain({ widenAud: false, tamperCommand: true });
+  expectReject('对照：前序均合法、仅末端命令被篡改', onlyCmd, 'BAD_SIGNATURE', 2, '$["sig"]');
+
+  // 对照二：前序放宽成立但末端未篡改 → 仍定位前序放宽
+  const onlyWiden = buildWidenedThenTamperedChain({ widenAud: true, tamperCommand: false });
+  expectReject('对照：仅前序放宽、末端合法', onlyWiden, 'NOT_TIGHTENED', 1, '$["aud"]');
+
+  // 对照三：更早跳签名失败优先于更晚跳的放宽
+  const root = generateKeyPair();
+  const a = generateKeyPair();
+  const b = generateKeyPair();
+  const d1 = issueDelegation({
+    iss: root.publicJwk, sub: a.publicJwk,
+    nbf: NOW - 3600, exp: NOW + 3600,
+    aud: ['buoy-01'], maxSamples: 100,
+  }, root.privateJwk);
+  let d2 = issueDelegation({
+    iss: a.publicJwk, sub: b.publicJwk,
+    nbf: NOW - 1800, exp: NOW + 1800,
+    aud: ['buoy-01'], maxSamples: 60,
+  }, a.privateJwk);
+  // 改写 hop1 已签名载荷但不重签
+  const d2v = parseCanonical(d2, { requireOrderedKeys: false }).value;
+  d2v.maxSamples = 61;
+  d2 = canonicalize(d2v);
+  // hop2 由 B 合法重签，但相对被改写的 hop1 文本放宽 maxSamples
+  const cmd = issueCommand({
+    iss: b.publicJwk, sub: b.publicJwk,
+    nbf: NOW - 900, exp: NOW + 900,
+    aud: ['buoy-01'], maxSamples: 99,
+    buoy: 'buoy-01', samples: 40,
+  }, b.privateJwk);
+  expectReject('对照：更早跳签名失败优先于更晚跳放宽', {
+    rootKeyText: rootKeyDocument(root.publicJwk), objectTexts: [d1, d2, cmd], now: NOW,
+  }, 'BAD_SIGNATURE', 1, '$["sig"]');
+}
+
+// ---------- 4) 篡改签名 / 改写载荷 ----------
 function sectionTamper() {
-  console.log('\n[3/6] 篡改签名与改写载荷拒绝复核');
+  console.log('\n[4/7] 篡改签名与改写载荷拒绝复核');
 
   let c = buildValidChain({ now: NOW });
   let v = parseCanonical(c.objectTexts[0], { requireOrderedKeys: false }).value;
@@ -216,7 +313,7 @@ function sectionTamper() {
 
 // ---------- 4) 结构性 / 数值错误 ----------
 function sectionStructural() {
-  console.log('\n[4/6] 结构性与数值错误定位复核');
+  console.log('\n[5/7] 结构性与数值错误定位复核');
   const cases = [
     { name: '重复键', code: 'DUPLICATE_KEY',
       mutate: (t) => t.replace('"maxSamples":100', '"maxSamples":100,"maxSamples":9') },
@@ -264,7 +361,7 @@ function run(cmd, args, timeoutMs = 120000) {
 }
 
 async function sectionTestsAndPage() {
-  console.log('\n[5/6] 代码测试与页面构建检查');
+  console.log('\n[6/7] 代码测试与页面构建检查');
   const t = await run(process.execPath, ['--test', '--test-concurrency=2', 'tests/']);
   const testCount = (t.out.match(/# tests (\d+)/) || [])[1];
   const passCount = (t.out.match(/# pass (\d+)/) || [])[1];
@@ -307,7 +404,7 @@ async function waitForHealth(port, tries = 60) {
 }
 
 async function smokeGateway(label, target) {
-  console.log(`\n[6/6] 健康地址 API/HTTP 冒烟（${label}）`);
+  console.log(`\n[7/7] 健康地址 API/HTTP 冒烟（${label}）`);
 
   const health = await httpRequest('GET', '/health', target);
   const healthJson = JSON.parse(health.body);
@@ -354,6 +451,45 @@ async function smokeGateway(label, target) {
     && badJson.error.code === 'BAD_SIGNATURE' && badJson.error.hop === 0,
     `status=${badResp.status}`);
 
+  // 组合场景（真实 HTTP）：前序已签名放宽浮标集合、末端命令签名被篡改
+  const combo = buildWidenedThenTamperedChain({ widenAud: true, tamperCommand: true });
+  const comboResp = await httpRequest('POST', '/api/verify', {
+    ...target,
+    body: JSON.stringify({ rootKey: combo.rootKeyText, objects: combo.objectTexts, now: combo.now }),
+  });
+  const comboJson = JSON.parse(comboResp.body);
+  check('POST /api/verify 前序放宽+末端篡改 → 422 NOT_TIGHTENED 稳定定位 hop=1 aud',
+    comboResp.status === 422 && comboJson.ok === false
+    && comboJson.error.code === 'NOT_TIGHTENED'
+    && comboJson.error.hop === 1 && comboJson.error.field === '$["aud"]'
+    && /buoy-02/.test(comboJson.error.message || ''),
+    `status=${comboResp.status}, body=${comboResp.body.slice(0, 200)}`);
+
+  // 组合场景对照（真实 HTTP）：前序均合法、仅末端命令被篡改 → hop=2 签名失败
+  const onlyCmd = buildWidenedThenTamperedChain({ widenAud: false, tamperCommand: true });
+  const onlyCmdResp = await httpRequest('POST', '/api/verify', {
+    ...target,
+    body: JSON.stringify({ rootKey: onlyCmd.rootKeyText, objects: onlyCmd.objectTexts, now: onlyCmd.now }),
+  });
+  const onlyCmdJson = JSON.parse(onlyCmdResp.body);
+  check('POST /api/verify 仅末端篡改对照 → 422 BAD_SIGNATURE（hop=2）',
+    onlyCmdResp.status === 422 && onlyCmdJson.ok === false
+    && onlyCmdJson.error.code === 'BAD_SIGNATURE' && onlyCmdJson.error.hop === 2,
+    `status=${onlyCmdResp.status}`);
+
+  // 首跳根公钥不符（真实 HTTP）：hop0 自身签名仍有效，但 iss ≠ 粘贴的根公钥
+  const wrongRoot = buildWidenedThenTamperedChain({ widenAud: false, tamperCommand: false });
+  wrongRoot.rootKeyText = rootKeyDocument(generateKeyPair().publicJwk);
+  const wrongRootResp = await httpRequest('POST', '/api/verify', {
+    ...target,
+    body: JSON.stringify({ rootKey: wrongRoot.rootKeyText, objects: wrongRoot.objectTexts, now: wrongRoot.now }),
+  });
+  const wrongRootJson = JSON.parse(wrongRootResp.body);
+  check('POST /api/verify 首跳根公钥不符 → 422 ISSUER_NOT_ROOT（hop=0）',
+    wrongRootResp.status === 422 && wrongRootJson.ok === false
+    && wrongRootJson.error.code === 'ISSUER_NOT_ROOT' && wrongRootJson.error.hop === 0,
+    `status=${wrongRootResp.status}`);
+
   const dup = buildValidChain({ now: Math.floor(Date.now() / 1000) });
   dup.objectTexts[0] = dup.objectTexts[0].replace('"maxSamples":100', '"maxSamples":100,"maxSamples":9');
   const dupResp = await httpRequest('POST', '/api/verify', {
@@ -373,6 +509,7 @@ async function main() {
   console.log('=== verify：受限委托链复核一次性验收 ===');
   sectionValidChain();
   sectionOverPrivileged();
+  sectionFirstViolationOrdering();
   sectionTamper();
   sectionStructural();
   await sectionTestsAndPage();

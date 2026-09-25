@@ -115,6 +115,123 @@ test('iss 与签名密钥都被换成攻击者：先过签名，再被 ISSUER_MI
   assert.equal(r.error.field, '$["iss"]');
 });
 
+// 组合场景夹具：root -> A 仅允许 buoy-01；A -> B 的委托签名完全有效，
+// 但把允许浮标扩大到 buoy-02；末端由 B 签发命令，随后改写命令中一个
+// 已签名业务字段（samples）且不重新签名。
+function chain3WithHop1Widening({
+  widenAud = false, widenExp = false, widenMax = false, tamperCommand = true,
+} = {}) {
+  const root = generateKeyPair();
+  const a = generateKeyPair();
+  const b = generateKeyPair();
+  const d1 = issueDelegation({
+    iss: root.publicJwk, sub: a.publicJwk,
+    nbf: NOW - 3600, exp: NOW + 1800,
+    aud: ['buoy-01'], maxSamples: 100,
+  }, root.privateJwk);
+  const d2 = issueDelegation({
+    iss: a.publicJwk, sub: b.publicJwk,
+    nbf: NOW - 1800,
+    exp: widenExp ? NOW + 3600 : NOW + 1800,
+    aud: widenAud ? ['buoy-01', 'buoy-02'] : ['buoy-01'],
+    maxSamples: widenMax ? 101 : 60,
+  }, a.privateJwk);
+  let cmd = issueCommand({
+    iss: b.publicJwk, sub: b.publicJwk,
+    nbf: NOW - 900, exp: NOW + 900,
+    aud: ['buoy-01'], maxSamples: 60,
+    buoy: 'buoy-01', samples: 40,
+  }, b.privateJwk);
+  if (tamperCommand) {
+    const v = parseCanonical(cmd, { requireOrderedKeys: false }).value;
+    v.samples = 41;
+    cmd = canonicalize(v);
+  }
+  return {
+    rootKeyText: rootKeyDocument(root.publicJwk),
+    objectTexts: [d1, d2, cmd],
+    now: NOW,
+  };
+}
+
+test('前序已签名放宽浮标集合、后续命令签名被篡改：优先定位前序 NOT_TIGHTENED(aud)', () => {
+  const c = chain3WithHop1Widening({ widenAud: true });
+  const r = verifyChain(c);
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'NOT_TIGHTENED');
+  assert.equal(r.error.hop, 1);
+  assert.equal(r.error.field, '$["aud"]');
+  assert.match(r.error.message, /buoy-02/);
+});
+
+test('组合场景重复核验：首个违规的跳号/字段/说明稳定不变', () => {
+  const c = chain3WithHop1Widening({ widenAud: true });
+  const r1 = verifyChain(c);
+  const r2 = verifyChain(c);
+  assert.deepEqual(r1.error, r2.error);
+  assert.equal(r2.error.hop, 1);
+  assert.equal(r2.error.field, '$["aud"]');
+});
+
+test('对照：前序均合法、仅末端命令被篡改 → BAD_SIGNATURE 定位末端跳', () => {
+  const c = chain3();
+  const v = parseCanonical(c.objectTexts[2], { requireOrderedKeys: false }).value;
+  v.samples += 1;
+  c.objectTexts[2] = canonicalize(v);
+  const r = verifyChain(c);
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'BAD_SIGNATURE');
+  assert.equal(r.error.hop, 2);
+  assert.equal(r.error.field, '$["sig"]');
+});
+
+test('对照：前序放宽成立但末端未篡改 → 仍定位前序放宽', () => {
+  const c = chain3WithHop1Widening({ widenAud: true, tamperCommand: false });
+  const r = verifyChain(c);
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'NOT_TIGHTENED');
+  assert.equal(r.error.hop, 1);
+  assert.equal(r.error.field, '$["aud"]');
+});
+
+test('前序时间窗放宽（exp 延后）+ 末端签名篡改：仍定位前序 exp', () => {
+  const c = chain3WithHop1Widening({ widenExp: true });
+  const r = verifyChain(c);
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'NOT_TIGHTENED');
+  assert.equal(r.error.hop, 1);
+  assert.equal(r.error.field, '$["exp"]');
+});
+
+test('前序采样上限放宽 + 末端签名篡改：仍定位前序 maxSamples', () => {
+  const c = chain3WithHop1Widening({ widenMax: true });
+  const r = verifyChain(c);
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'NOT_TIGHTENED');
+  assert.equal(r.error.hop, 1);
+  assert.equal(r.error.field, '$["maxSamples"]');
+});
+
+test('更早跳的签名失败优先于更晚跳已成立的限制放宽', () => {
+  // hop1 载荷被改写且未重签（该跳必签名失败）；hop2 由 B 合法重签，
+  // 但 maxSamples=99 相对 hop1 文本构成放宽。链序上 hop1 先可判定，
+  // 必须报告 hop1 BAD_SIGNATURE，而不是 hop2 的放宽。
+  const c = chain3();
+  const v = parseCanonical(c.objectTexts[1], { requireOrderedKeys: false }).value;
+  v.maxSamples = 61; // 改写 hop1 已签名内容但不重签
+  c.objectTexts[1] = canonicalize(v);
+  c.objectTexts[2] = issueCommand({
+    iss: c.b.publicJwk, sub: c.b.publicJwk,
+    nbf: NOW - 900, exp: NOW + 900,
+    aud: ['buoy-01'], maxSamples: 99,
+    buoy: 'buoy-01', samples: 40,
+  }, c.b.privateJwk);
+  const r = verifyChain(c);
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'BAD_SIGNATURE');
+  assert.equal(r.error.hop, 1);
+});
+
 test('时间窗放宽（exp 延后）：NOT_TIGHTENED 定位 exp', () => {
   const root = generateKeyPair();
   const a = generateKeyPair();
