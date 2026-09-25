@@ -259,6 +259,88 @@ test('签名被直接篡改：BAD_SIGNATURE', () => {
   assert.equal(r.error.code, 'BAD_SIGNATURE');
 });
 
+// 组合场景：root→A 仅允许 buoy-01；A→B 签名完全有效但放宽出 buoy-02；
+// B 的末端命令签发后改写一个已签名业务字段（samples）而不重签。
+function wideningThenTamperedChain() {
+  const root = generateKeyPair();
+  const a = generateKeyPair();
+  const b = generateKeyPair();
+  const d1 = issueDelegation({
+    iss: root.publicJwk, sub: a.publicJwk,
+    nbf: NOW - 3600, exp: NOW + 3600,
+    aud: ['buoy-01'], maxSamples: 100,
+  }, root.privateJwk);
+  const d2 = issueDelegation({ // 有效签名，但浮标集合被放宽
+    iss: a.publicJwk, sub: b.publicJwk,
+    nbf: NOW - 1800, exp: NOW + 1800,
+    aud: ['buoy-01', 'buoy-02'], maxSamples: 50,
+  }, a.privateJwk);
+  let cmd = issueCommand({
+    iss: b.publicJwk, sub: b.publicJwk,
+    nbf: NOW - 900, exp: NOW + 900,
+    aud: ['buoy-01'], maxSamples: 50,
+    buoy: 'buoy-01', samples: 10,
+  }, b.privateJwk);
+  const tamperedValue = parseCanonical(cmd, { requireOrderedKeys: false }).value;
+  tamperedValue.samples = 11; // 改写已签名业务字段，不重新签名
+  cmd = canonicalize(tamperedValue);
+  return {
+    root, a, b,
+    rootKeyText: rootKeyDocument(root.publicJwk),
+    objectTexts: [d1, d2, cmd],
+    now: NOW,
+  };
+}
+
+test('前序已签名放宽 + 后续签名被篡改：优先定位前序浮标放宽（稳定可复现）', () => {
+  const c = wideningThenTamperedChain();
+  for (let round = 0; round < 3; round++) { // 重复核验，结论必须稳定
+    const r = verifyChain(c);
+    assert.equal(r.ok, false);
+    assert.equal(r.error.code, 'NOT_TIGHTENED');
+    assert.equal(r.error.hop, 1);
+    assert.equal(r.error.field, '$["aud"]');
+    assert.match(r.error.message, /buoy-02/);
+  }
+});
+
+test('前序均合法时单独篡改末端命令：仍定位该对象的签名失败', () => {
+  const c = wideningThenTamperedChain();
+  // 把第 1 跳换成收紧的合法委托（仅 buoy-01），其余保持不变
+  c.objectTexts[1] = issueDelegation({
+    iss: c.a.publicJwk, sub: c.b.publicJwk,
+    nbf: NOW - 1800, exp: NOW + 1800,
+    aud: ['buoy-01'], maxSamples: 50,
+  }, c.a.privateJwk);
+  const r = verifyChain(c);
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'BAD_SIGNATURE');
+  assert.equal(r.error.hop, 2);
+  assert.equal(r.error.field, '$["sig"]');
+});
+
+test('前序均合法时单独篡改中间委托：定位该跳的签名失败', () => {
+  const c = chain3();
+  const v = parseCanonical(c.objectTexts[1], { requireOrderedKeys: false }).value;
+  v.maxSamples = 61; // 不改签名
+  c.objectTexts[1] = canonicalize(v);
+  const r = verifyChain(c);
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'BAD_SIGNATURE');
+  assert.equal(r.error.hop, 1);
+});
+
+test('前序放宽不被后续对象的结构错误掩盖', () => {
+  const c = wideningThenTamperedChain();
+  // 末端命令换成结构非法文档（重复键）：首个违规仍是第 1 跳的浮标放宽
+  c.objectTexts[2] = c.objectTexts[2].replace('"samples":11', '"samples":11,"samples":12');
+  const r = verifyChain(c);
+  assert.equal(r.ok, false);
+  assert.equal(r.error.code, 'NOT_TIGHTENED');
+  assert.equal(r.error.hop, 1);
+  assert.equal(r.error.field, '$["aud"]');
+});
+
 test('输入层异常：重复键 / 键序不规范 / 越界整数 / 不安全整数 均可定位', () => {
   const c = buildValidChain({ now: NOW });
   const cases = [

@@ -19,7 +19,9 @@
 //      maxSamples 不大于上一跳；
 //   3. 每跳在评估时刻必须处于有效期内；
 //   4. 末端命令的 buoy 须获全部上游 aud 允许，samples 不超过任一 maxSamples；
-//   5. 任一失败即拒绝，并定位首个限制字段或签名失败跳。
+//   5. 按跳序逐跳核验（解析 → 验签 → 签发关系 → 收紧 → 时效），任一失败即
+//      拒绝并定位首个违规跳：后续跳的问题不掩盖此前跳已成立的违规；同一跳内
+//      先验签后业务规则，单独篡改某一对象仍定位该对象的签名失败。
 
 import crypto from 'node:crypto';
 import {
@@ -233,6 +235,10 @@ function verifyChain(input) {
     return fail(new ChainError('SCHEMA', -1, 'objects', `链过长（>${MAX_CHAIN_LEN} 跳）`));
   }
 
+  // 逐跳核验：每一跳依次完成 解析 → 模式 → 验签 → 签发关系 → 收紧 → 时效，
+  // 首个失败即返回。这样后续跳的问题（签名被篡改、结构错误等）不会掩盖
+  // 此前跳已经成立的违规（如已签名但放宽限制的委托）；同一跳内先验签，
+  // 因此单独篡改某一对象仍定位该对象的签名失败。
   const hops = [];
   for (let i = 0; i < texts.length; i++) {
     const text = texts[i];
@@ -260,30 +266,20 @@ function verifyChain(input) {
     const payloadBytes = canonicalBytes(payload);
     const payloadDigest = sha256Hex(payloadBytes);
 
-    hops.push({ model, payloadBytes, payloadDigest, sig: model.sig });
-  }
-
-  for (let i = 0; i < hops.length; i++) {
-    const hop = hops[i];
-
-    // 1) 逐跳验签（用本跳 iss 的公钥）
+    // 1) 本跳验签（用本跳 iss 的公钥）
     let sigOk = false;
     try {
-      sigOk = crypto.verify('sha256', hop.payloadBytes, {
-        key: importJwk(hop.model.iss),
+      sigOk = crypto.verify('sha256', payloadBytes, {
+        key: importJwk(model.iss),
         dsaEncoding: 'ieee-p1363',
-      }, hop.model.sigRaw);
+      }, model.sigRaw);
     } catch {
       sigOk = false;
     }
     if (!sigOk) {
       return fail(new ChainError('BAD_SIGNATURE', i, '$["sig"]',
-        `第 ${i} 跳签名验证失败（签名与规范载荷摘要不符，载荷 SHA-256=${hop.payloadDigest}）`));
+        `第 ${i} 跳签名验证失败（签名与规范载荷摘要不符，载荷 SHA-256=${payloadDigest}）`));
     }
-  }
-
-  for (let i = 0; i < hops.length; i++) {
-    const model = hops[i].model;
 
     // 2) 链式签发关系
     if (i === 0) {
@@ -328,6 +324,8 @@ function verifyChain(input) {
       return fail(new ChainError('TIME_EXPIRED', i, '$["exp"]',
         `第 ${i} 跳已过期（now=${now} > exp=${model.exp}）`));
     }
+
+    hops.push({ model, payloadBytes, payloadDigest, sig: model.sig });
   }
 
   // ---- 末端命令：浮标须获全部上游允许、采样量不超过任一上限 ----

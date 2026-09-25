@@ -4,6 +4,8 @@
 // 一次性验收服务 verify：
 //   1. 复核合法链的逐跳证据（每跳签名、规范载荷摘要、收紧约束、准许结论）；
 //   2. 复核越权链的拒绝（浮标未获上游允许 / 采样量超限 / 约束放宽），定位跳与字段；
+//      含「前序已签名放宽 + 后续签名被篡改」组合场景：必须稳定定位前序放宽，
+//      末端签名错误不得掩盖；前序均合法时单独篡改仍定位该对象签名失败；
 //   3. 复核篡改签名 / 改写载荷的拒绝（BAD_SIGNATURE）；
 //   4. 复核结构性错误（重复键、键序不规范、不安全 / 越界整数、非有限数、链首非根公钥）；
 //   5. 运行相关代码测试（node --test tests/）与页面构建检查；
@@ -62,6 +64,32 @@ function resign(value, privateJwk) {
     { key, dsaEncoding: 'ieee-p1363' });
   const sigB64 = sigBuf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   return canonicalize({ ...payload, sig: sigB64 });
+}
+
+// 组合场景链：root→A 仅允许 buoy-01；A→B 签名完全有效但把浮标集合放宽出
+// buoy-02；B 的末端命令签发后改写一个已签名业务字段（samples）而不重签。
+// 首个违规是第 1 跳的浮标放宽，末端签名错误不得掩盖它。
+function buildWidenedThenTamperedChain(now) {
+  const root = generateKeyPair();
+  const a = generateKeyPair();
+  const b = generateKeyPair();
+  const d1 = issueDelegation({
+    iss: root.publicJwk, sub: a.publicJwk,
+    nbf: now - 3600, exp: now + 3600, aud: ['buoy-01'], maxSamples: 100,
+  }, root.privateJwk);
+  const d2 = issueDelegation({ // 有效签名，但 aud 被放宽
+    iss: a.publicJwk, sub: b.publicJwk,
+    nbf: now - 1800, exp: now + 1800, aud: ['buoy-01', 'buoy-02'], maxSamples: 50,
+  }, a.privateJwk);
+  let cmd = issueCommand({
+    iss: b.publicJwk, sub: b.publicJwk,
+    nbf: now - 900, exp: now + 900, aud: ['buoy-01'], maxSamples: 50,
+    buoy: 'buoy-01', samples: 10,
+  }, b.privateJwk);
+  const v = parseCanonical(cmd, { requireOrderedKeys: false }).value;
+  v.samples = 11; // 篡改已签名业务字段，不重新签名
+  cmd = canonicalize(v);
+  return { a, b, rootKeyText: rootKeyDocument(root.publicJwk), objectTexts: [d1, d2, cmd], now };
 }
 
 // ---------- 1) 合法链逐跳证据 ----------
@@ -187,6 +215,23 @@ function sectionOverPrivileged() {
   expectReject('委托非前一主体签发', {
     rootKeyText: rootKeyDocument(root2.publicJwk), objectTexts: [dd1, dd2, cc], now: NOW,
   }, 'ISSUER_MISMATCH', 1, '$["iss"]');
+
+  // 2g. 组合场景：前序委托签名有效但放宽浮标集合，末端命令又被篡改（签名失效）。
+  //     首个违规是前序放宽，必须稳定定位 NOT_TIGHTENED(hop=1, aud)，
+  //     末端命令的签名错误不得改变首个业务违规的跳号、字段与说明。
+  const combo = buildWidenedThenTamperedChain(NOW);
+  for (let round = 1; round <= 3; round++) {
+    expectReject(`前序已签名放宽、后续签名被篡改（第 ${round} 次复核）`,
+      combo, 'NOT_TIGHTENED', 1, '$["aud"]');
+  }
+
+  // 2h. 对照：前序各跳均合法、仅末端命令被篡改时，定位末端对象的签名失败
+  const comboLegal = buildWidenedThenTamperedChain(NOW);
+  comboLegal.objectTexts[1] = issueDelegation({
+    iss: comboLegal.a.publicJwk, sub: comboLegal.b.publicJwk,
+    nbf: NOW - 1800, exp: NOW + 1800, aud: ['buoy-01'], maxSamples: 50,
+  }, comboLegal.a.privateJwk);
+  expectReject('前序合法时末端篡改定位该对象签名失败', comboLegal, 'BAD_SIGNATURE', 2, '$["sig"]');
 }
 
 // ---------- 3) 篡改签名 / 改写载荷 ----------
@@ -353,6 +398,20 @@ async function smokeGateway(label, target) {
     badResp.status === 422 && badJson.ok === false
     && badJson.error.code === 'BAD_SIGNATURE' && badJson.error.hop === 0,
     `status=${badResp.status}`);
+
+  // 组合场景（真实 HTTP）：前序委托签名有效但放宽浮标集合，末端命令被篡改未重签。
+  // 必须定位前序 NOT_TIGHTENED(hop=1, $["aud"])，而非末端的 BAD_SIGNATURE。
+  const combo = buildWidenedThenTamperedChain(Math.floor(Date.now() / 1000));
+  const comboResp = await httpRequest('POST', '/api/verify', {
+    ...target,
+    body: JSON.stringify({ rootKey: combo.rootKeyText, objects: combo.objectTexts, now: combo.now }),
+  });
+  const comboJson = JSON.parse(comboResp.body);
+  check('POST /api/verify 前序放宽+末端篡改 → 422 NOT_TIGHTENED（hop=1, aud）',
+    comboResp.status === 422 && comboJson.ok === false
+    && comboJson.error.code === 'NOT_TIGHTENED' && comboJson.error.hop === 1
+    && comboJson.error.field === '$["aud"]',
+    `status=${comboResp.status}`);
 
   const dup = buildValidChain({ now: Math.floor(Date.now() / 1000) });
   dup.objectTexts[0] = dup.objectTexts[0].replace('"maxSamples":100', '"maxSamples":100,"maxSamples":9');
